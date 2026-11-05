@@ -101,9 +101,9 @@ SETTINGS = dict(
 
     # ---- training ---------------------------------------------------------
     batch_size=64,
-    epochs=30,
+    epochs=100,
     patience=6,                        # stop if val error hasn't improved for 6 epochs
-    head_warmup_epochs=2,              # epochs with the encoder frozen (pretrained only)
+    head_warmup_epochs=10,              # epochs with the encoder frozen (pretrained only)
     lr_encoder=5e-5,                   # small: gently adjust pretrained weights
     lr_encoder_scratch=3e-4,           # larger: used when training from random weights
     lr_head=1e-3,                      # the new head learns faster

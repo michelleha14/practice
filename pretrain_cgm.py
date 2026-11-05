@@ -24,9 +24,9 @@ from torch.utils.data import DataLoader, TensorDataset
 # Settings (edit here)
 # --------------------------------------------------------------------------
 CFG = dict(
-    seq_file="cgm_daily_sequences.npz",
-    meta_file="cgm_daily_meta.csv",
-    out_file="cgm_pretrained.pt",
+    seq_file="cgm_daily_sequences_50.npz",
+    meta_file="cgm_daily_meta_50.csv",
+    out_file="cgm_pretrained_50.pt",
     # masking
     mask_ratio=0.10,     # fraction of steps hidden per day (approx.)
     span_len=6,          # hide contiguous chunks of 6 steps (30 min). 1 = random single points
@@ -37,9 +37,9 @@ CFG = dict(
     d_ff=256, # dimension of feedforward, number of nodes (size of dense layer)
     dropout=0.1, # randomly turn off the nodes to prevent overfitting; a form of regularization
     # training
-    batch_size=32, # looking at 64 random sequences out of 193 at the same time, 
+    batch_size=16, # looking at 64 random sequences out of 193 at the same time, 
     # when we calculate the loss )to calc the gradient) to update the model, we want it to reflect the entire data
-    epochs=500, # itiration through entire dataset
+    epochs=300, # itiration through entire dataset
     lr=3e-4, # learning rate
     weight_decay=0.01, # making lr smaller at each training step
     warmup_frac=0.05, 

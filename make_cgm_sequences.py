@@ -122,12 +122,12 @@ except ImportError:
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("pseudo_cgm_5min_data_500_subjects.csv")   # <- change to your file
+    df = pd.read_csv("pseudo_cgm_data_50_subjects_r.csv")   # <- change to your file
 
     X, obs_mask, meta = make_daily_sequences(df)
     print("X:", X.shape, "| mask:", obs_mask.shape)
     print(meta.groupby("subject_id").size().describe())
 
     meta["split"] = split_by_subject(meta)
-    np.savez_compressed("cgm_daily_sequences.npz", X=X, obs_mask=obs_mask)
-    meta.to_csv("cgm_daily_meta.csv", index=False)
+    np.savez_compressed("cgm_daily_sequences_50.npz", X=X, obs_mask=obs_mask)
+    meta.to_csv("cgm_daily_meta_50.csv", index=False)
