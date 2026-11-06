@@ -93,7 +93,9 @@ score_session <- function(d, cfg) {
   dt <- c(NA, diff(t)) / 60
   ad <- ifelse(!is.na(dt) & dt <= cfg$max_dt_min, abs(c(NA, diff(g))), NA)
 
-  W      <- cfg$window_h * 3600
+  W <- cfg$window_h * 3600
+  # skip sessions too short to hold min_windows windows (also avoids seq() "wrong sign" error)
+  if (max(t) - min(t) < W + (cfg$min_windows - 1) * cfg$step_h * 3600) return(tibble())
   starts <- seq(min(t), max(t) - W, by = cfg$step_h * 3600)
   if (length(starts) < cfg$min_windows) return(tibble())
 
