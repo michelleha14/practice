@@ -1,0 +1,235 @@
+---
+title: "Detecting CGM sensor deterioration segments"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 11, fig.height = 3.5)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+```
+
+## Idea
+
+A deteriorating sensor typically shows (as in your plot after June 2):
+
+1. **More point-to-point noise** (jagged trace, big jumps between consecutive readings)
+2. **A drop / drift in level** (readings sag toward the low end)
+
+For each subject and each continuous sensor *session* (split at gaps longer than `session_gap_h`):
+
+1. Compute **rolling-window features**: noise (75th percentile of |Δglucose| between consecutive readings) and level (median glucose).
+2. Compare each window to the **session's own baseline** using robust z-scores (median / MAD), so no fixed glucose thresholds are needed.
+3. Flag windows with high noise, or with a level drop combined with at least somewhat elevated noise.
+4. Merge nearby flagged windows into **segments** and drop segments shorter than `min_seg_h`.
+
+## Settings
+
+```{r config}
+cfg <- list(
+  window_h        = 12,    # rolling window length (hours)
+  step_h          = 3,     # window step (hours)
+  max_dt_min      = 20,    # only use consecutive readings <= this far apart for |diff|
+  min_cov         = 0.5,   # min fraction of expected readings in a window
+  session_gap_h   = 12,    # gap that starts a new sensor session
+  min_windows     = 10,    # sessions with fewer windows are skipped (baseline unreliable)
+  baseline_days   = NULL,  # NULL = whole session median; or e.g. 5 = use first 5 days as baseline
+  z_noise         = 3,     # noise z-score threshold
+  z_level         = 3,     # level-drop z-score threshold
+  z_level_noise_min = 1,   # noise z needed in addition to a level drop
+  merge_gap_h     = 12,    # merge flagged windows separated by less than this
+  min_seg_h       = 24     # minimum segment duration to report
+)
+```
+
+## Input data
+
+Replace this chunk with your own data frame. It needs the columns `subject`, `gluc_time` (POSIXct) and `gl`.
+
+```{r data}
+# dat_raw <- readRDS("your_data.rds")   # <- your data here
+
+# ---- demo data (delete when using real data) ----
+simulate_cgm <- function(subject, days = 22, det_day = NULL) {
+  t <- seq(as.POSIXct("2025-05-14 00:00:00", tz = "UTC"), by = "5 min", length.out = days * 288)
+  h <- as.numeric(format(t, "%H")) + as.numeric(format(t, "%M")) / 60
+  gl <- 110 + 15 * sin(2 * pi * (h - 8) / 24) +
+    as.numeric(arima.sim(list(ar = 0.95), n = length(t), sd = 4)) + rnorm(length(t), 0, 1.5)
+  if (!is.null(det_day)) {
+    k <- t >= t[1] + det_day * 86400
+    gl[k] <- gl[k] - 15 + rnorm(sum(k), 0, 9)
+  }
+  tibble(subject = subject, gluc_time = t, gl = gl)
+}
+set.seed(1)
+dat_raw <- bind_rows(simulate_cgm("S1", det_day = 19),
+                     simulate_cgm("S2"),
+                     simulate_cgm("S3", det_day = 15))
+```
+
+```{r prep}
+dat <- dat_raw %>%
+  filter(!is.na(gl), !is.na(gluc_time)) %>%
+  arrange(subject, gluc_time) %>%
+  distinct(subject, gluc_time, .keep_all = TRUE) %>%
+  group_by(subject) %>%
+  mutate(dt_min  = as.numeric(difftime(gluc_time, lag(gluc_time), units = "mins")),
+         session = cumsum(is.na(dt_min) | dt_min > cfg$session_gap_h * 60)) %>%
+  ungroup()
+```
+
+## Functions
+
+```{r functions}
+# Rolling-window features + robust z-scores for ONE subject-session
+score_session <- function(d, cfg) {
+  t  <- as.numeric(d$gluc_time)
+  g  <- d$gl
+  tz <- attr(d$gluc_time, "tzone"); if (is.null(tz)) tz <- ""
+  dt <- c(NA, diff(t)) / 60
+  ad <- ifelse(!is.na(dt) & dt <= cfg$max_dt_min, abs(c(NA, diff(g))), NA)
+
+  W      <- cfg$window_h * 3600
+  starts <- seq(min(t), max(t) - W, by = cfg$step_h * 3600)
+  if (length(starts) < cfg$min_windows) return(tibble())
+
+  step_dt  <- median(dt, na.rm = TRUE)
+  expected <- W / 60 / step_dt
+
+  f <- map_dfr(starts, function(s) {
+    lo <- findInterval(s,     t, left.open = TRUE) + 1
+    hi <- findInterval(s + W, t, left.open = TRUE)
+    i  <- if (hi >= lo) lo:hi else integer(0)
+    a  <- ad[i]; a <- a[!is.na(a)]
+    tibble(win_start = .POSIXct(s, tz = tz),
+           win_end   = .POSIXct(s + W, tz = tz),
+           cov   = length(i) / expected,
+           noise = if (length(a) >= 10) unname(quantile(a, 0.75)) else NA_real_,
+           level = if (length(i) > 0) median(g[i]) else NA_real_)
+  })
+
+  ok <- f$cov >= cfg$min_cov & !is.na(f$noise) & !is.na(f$level)
+  base <- ok
+  if (!is.null(cfg$baseline_days)) {
+    base <- base & as.numeric(f$win_start) < min(t) + cfg$baseline_days * 86400
+  }
+  if (sum(base) < 5) base <- ok
+  if (sum(base) < 5) return(tibble())
+
+  robust_sd <- function(x) pmax(mad(x), 0.1 * abs(median(x)), 1e-6)  # floor avoids tiny MAD
+  f %>% mutate(
+    z_noise = (noise - median(noise[base])) / robust_sd(noise[base]),
+    z_level = (median(level[base]) - level)   / robust_sd(level[base]),   # positive = lower than usual
+    flag    = ok & (z_noise > cfg$z_noise |
+                    (z_level > cfg$z_level & z_noise > cfg$z_level_noise_min)),
+    session_start = min(d$gluc_time),
+    session_end   = max(d$gluc_time)
+  )
+}
+
+# Merge flagged windows into segments for ONE subject-session
+make_segments <- function(f, cfg) {
+  fl <- f %>% filter(flag)
+  if (nrow(fl) == 0) return(tibble())
+  s <- as.numeric(fl$win_start); e <- as.numeric(fl$win_end)
+  prev_max <- c(-Inf, head(cummax(e), -1))
+  grp <- cumsum(s - prev_max > cfg$merge_gap_h * 3600)
+
+  fl %>%
+    mutate(grp = grp) %>%
+    group_by(grp) %>%
+    summarise(seg_start   = min(win_start),
+              seg_end     = min(max(win_end), first(session_end)),
+              n_windows   = n(),
+              max_z_noise = max(z_noise),
+              max_z_level = max(z_level),
+              session_end = first(session_end),
+              .groups = "drop") %>%
+    mutate(duration_h = as.numeric(difftime(seg_end, seg_start, units = "hours")),
+           runs_to_sensor_end = seg_end >= session_end - cfg$window_h * 3600) %>%
+    filter(duration_h >= cfg$min_seg_h) %>%
+    select(-grp, -session_end)
+}
+```
+
+## Run detection
+
+```{r run}
+scored <- dat %>%
+  group_by(subject, session) %>%
+  group_modify(~ score_session(.x, cfg)) %>%
+  ungroup()
+
+segments <- scored %>%
+  group_by(subject, session) %>%
+  group_modify(~ make_segments(.x, cfg)) %>%
+  ungroup()
+```
+
+## Result: flagged segments
+
+```{r result}
+segments %>% mutate(across(c(duration_h, max_z_noise, max_z_level), ~ round(.x, 1)))
+```
+
+As a list, one element per subject (subjects with no flagged segment are included as empty):
+
+```{r result-list}
+all_subjects <- unique(dat$subject)
+flagged_list <- map(setNames(all_subjects, all_subjects), function(s) {
+  segments %>% filter(subject == s) %>% select(seg_start, seg_end, duration_h)
+})
+flagged_list
+```
+
+Subjects with at least one flagged segment:
+
+```{r flagged-subjects}
+unique(segments$subject)
+```
+
+```{r save, eval=FALSE}
+write.csv(segments, "flagged_segments.csv", row.names = FALSE)
+saveRDS(flagged_list, "flagged_segments_list.rds")
+```
+
+## Visual check
+
+Red shading = flagged segment.
+
+```{r plots, fig.height=3.2}
+walk(all_subjects, function(s) {
+  p <- ggplot(filter(dat, subject == s), aes(gluc_time, gl)) +
+    geom_point(size = 0.2) +
+    geom_rect(data = filter(segments, subject == s),
+              aes(xmin = seg_start, xmax = seg_end, ymin = -Inf, ymax = Inf),
+              inherit.aes = FALSE, fill = "red", alpha = 0.2) +
+    labs(title = paste("Subject", s), x = "Time", y = "Glucose") +
+    theme_minimal()
+  print(p)
+})
+```
+
+Window-level diagnostics (useful for tuning thresholds):
+
+```{r diag, fig.height=5}
+scored %>%
+  tidyr::pivot_longer(c(z_noise, z_level), names_to = "metric", values_to = "z") %>%
+  ggplot(aes(win_start, z, colour = metric)) +
+  geom_line() +
+  geom_hline(yintercept = c(cfg$z_noise), linetype = 2) +
+  facet_wrap(~ subject, scales = "free_x", ncol = 1) +
+  theme_minimal()
+```
+
+## Tuning notes
+
+- **Too many false positives:** raise `z_noise` / `min_seg_h`, or lengthen `window_h`.
+- **Missing subtle deterioration:** lower `z_noise` to about 2.5, or use `baseline_days = 5` so that a long deteriorated tail does not contaminate the baseline.
+- The baseline is the session's median, so this works when less than about half of the session is deteriorated. If a sensor is bad for most of its life, use `baseline_days`.
+- Segment start is accurate to about `window_h` (the first flagged window's start), because windows overlap. Reduce `window_h` and `step_h` for sharper onset estimates.
+- `runs_to_sensor_end = TRUE` means the segment lasts until the last reading of the session, which is the typical end-of-life failure.
