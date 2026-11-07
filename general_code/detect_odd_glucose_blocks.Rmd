@@ -1,0 +1,257 @@
+---
+title: "Flagging low-drifting CGM periods (12 h blocks vs history)"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 11, fig.height = 3.5)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+```
+
+## What this does
+
+For every sensor:
+
+1. Cut the recording (after the first `warmup_h` hours) into **non-overlapping 12 h blocks**. Blocks containing a gap longer than `max_gap_h` (1 h) are ignored.
+2. For each block, compare its mean glucose to the mean of **earlier healthy blocks** (the history up to that point). Blocks that were flagged are *not* added to the history.
+3. Flag a block if it is **lower** than the history by more than `z_low` SDs (SD of the earlier block means) **and** by more than `min_drop_pct` percent.
+4. Merge neighbouring flagged blocks into segments (at least `min_blocks` blocks).
+5. Separately, flag the **sensor start** if the first `warmup_h` hours are more than `start_rise_pct` percent above the following 24 hours.
+
+Only *lower* values are flagged in step 3, so high excursions (meals etc.) are ignored.
+
+## Settings
+
+```{r config}
+cfg <- list(
+  block_h          = 12,    # block length (hours); should divide 24
+  warmup_h         = 2,     # start-of-sensor period (hours), excluded from blocks
+  max_gap_h        = 1,     # blocks with a gap longer than this are ignored
+  min_block_h      = 6,     # shortest (last, partial) block allowed
+  min_hist_blocks  = 4,     # healthy blocks needed in the history before a block can be flagged
+  same_phase       = FALSE, # TRUE = compare only with earlier blocks at the same time of day (day vs day, night vs night)
+  z_low            = 2,     # block mean must be this many SDs below the history
+  min_drop_pct     = 10,    # ... and at least this many percent below it
+  min_sensor_day   = 0,     # only flag blocks after this sensor day (e.g. 7 to focus on end of life)
+  min_blocks       = 2,     # min number of flagged blocks in a reported segment
+  merge_gap_h      = 12,    # merge flagged blocks closer than this
+  start_rise_pct   = 20,    # start flagged if first warmup_h mean is this % above the next 24 h
+  session_gap_h    = 12,    # gap that starts a new sensor (ignored if a `sensor` column exists)
+  min_session_h    = 48     # skip sensors recorded for less than this
+)
+```
+
+## Input data
+
+Replace the demo with your data frame. Required columns: `subject`, `gluc_time` (POSIXct), `gl`. An optional `sensor` column (sensor ID) is used to define sensors; otherwise a gap longer than `session_gap_h` starts a new one.
+
+```{r data}
+# dat_raw <- readRDS("your_data.rds")   # <- your data here
+
+# ---- demo data (delete when using real data) ----
+simulate_cgm <- function(subject, days = 14, bad_from_day = NULL, high_start = FALSE, excursion_day = NULL) {
+  t <- seq(as.POSIXct("2025-05-14 10:00:00", tz = "UTC"), by = "5 min", length.out = days * 288)
+  h <- as.numeric(format(t, "%H")) + as.numeric(format(t, "%M")) / 60
+  gl <- 110 + 15 * sin(2 * pi * (h - 8) / 24) +
+    as.numeric(arima.sim(list(ar = 0.95), n = length(t), sd = 4)) + rnorm(length(t), 0, 1.5)
+  if (high_start) gl[1:24] <- gl[1:24] + 40
+  if (!is.null(excursion_day)) {
+    k <- t >= t[1] + excursion_day * 86400 & t < t[1] + (excursion_day + 0.5) * 86400
+    gl[k] <- gl[k] + 35                                 # high excursion: should NOT be flagged
+  }
+  if (!is.null(bad_from_day)) {
+    k <- t >= t[1] + bad_from_day * 86400
+    gl[k] <- gl[k] - 20 + rnorm(sum(k), 0, 8)           # lower and noisier
+  }
+  tibble(subject = subject, gluc_time = t, gl = gl)
+}
+set.seed(1)
+dat_raw <- bind_rows(simulate_cgm("S1", bad_from_day = 11, excursion_day = 4),
+                     simulate_cgm("S2"),
+                     simulate_cgm("S3", bad_from_day = 12, high_start = TRUE))
+```
+
+```{r prep}
+has_sensor <- "sensor" %in% names(dat_raw)
+
+dat <- dat_raw %>%
+  filter(!is.na(gl), !is.na(gluc_time)) %>%
+  arrange(subject, gluc_time) %>%
+  distinct(subject, gluc_time, .keep_all = TRUE) %>%
+  group_by(subject) %>%
+  mutate(gap_min = as.numeric(difftime(gluc_time, lag(gluc_time), units = "mins")),
+         session = if (has_sensor) match(sensor, unique(sensor))
+                   else cumsum(is.na(gap_min) | gap_min > cfg$session_gap_h * 60)) %>%
+  ungroup()
+```
+
+## Functions
+
+```{r functions}
+# Build 12 h blocks for ONE sensor and compare each with the history of earlier healthy blocks
+score_session <- function(d, cfg) {
+  H  <- 3600
+  t  <- as.numeric(d$gluc_time); g <- d$gl
+  t0 <- min(t); t1 <- max(t)
+  if ((t1 - t0) / H < cfg$min_session_h) return(tibble())
+  tz <- attr(d$gluc_time, "tzone"); if (is.null(tz)) tz <- ""
+  dt <- median(diff(t))
+  warm <- cfg$warmup_h * H
+
+  # ---- start-of-sensor check ----
+  iw <- t < t0 + warm
+  ib <- t >= t0 + warm & t < t0 + warm + 24 * H
+  start_rise <- if (sum(iw) >= 0.5 * warm / dt && sum(ib) >= 0.5 * 24 * H / dt) {
+    (mean(g[iw]) / mean(g[ib]) - 1) * 100
+  } else NA_real_
+
+  # ---- non-overlapping blocks after warm-up ----
+  bs <- seq(t0 + warm, t1, by = cfg$block_h * H)
+  b <- map_dfr(seq_along(bs), function(k) {
+    s  <- bs[k]; e <- min(s + cfg$block_h * H, t1)
+    ix <- which(t >= s & (t < e | e == t1))
+    max_gap <- if (length(ix) > 0) max(diff(c(s, t[ix], e))) / H else Inf
+    tibble(block_start = .POSIXct(s, tz = tz), block_end = .POSIXct(e, tz = tz),
+           phase   = (k - 1) %% round(24 / cfg$block_h),
+           n       = length(ix),
+           max_gap_h = max_gap,
+           mean_gl = if (length(ix) > 0) mean(g[ix]) else NA_real_,
+           ok      = length(ix) >= 2 && (e - s) / H >= cfg$min_block_h && max_gap <= cfg$max_gap_h)
+  })
+  b$ref_mean <- NA_real_; b$z <- NA_real_; b$drop_pct <- NA_real_; b$flag <- FALSE
+
+  # ---- compare each block with earlier healthy blocks (sequentially) ----
+  for (k in seq_len(nrow(b))) {
+    if (!b$ok[k]) next
+    prev <- seq_len(k - 1)
+    hist <- prev[b$ok[prev] & !b$flag[prev] & (!cfg$same_phase | b$phase[prev] == b$phase[k])]
+    if (length(hist) < cfg$min_hist_blocks) next
+    base <- weighted.mean(b$mean_gl[hist], b$n[hist])
+    sdh  <- max(sd(b$mean_gl[hist]), 0.05 * base)          # floor: 5% of the mean
+    drop <- base - b$mean_gl[k]
+    b$ref_mean[k] <- base
+    b$z[k]        <- drop / sdh
+    b$drop_pct[k] <- 100 * drop / base
+    late_enough   <- as.numeric(b$block_start[k]) - t0 >= cfg$min_sensor_day * 86400
+    b$flag[k]     <- late_enough && b$z[k] > cfg$z_low && b$drop_pct[k] >= cfg$min_drop_pct
+  }
+
+  b %>% mutate(start_rise_pct = start_rise,
+               session_start = .POSIXct(t0, tz = tz),
+               session_end   = .POSIXct(t1, tz = tz))
+}
+
+# Turn flagged blocks into segments for ONE sensor
+make_segments <- function(b, d, cfg) {
+  s0 <- b$session_start[1]; s1 <- b$session_end[1]
+  out <- list()
+
+  if (isTRUE(b$start_rise_pct[1] > cfg$start_rise_pct)) {
+    out$start <- tibble(type = "start_elevated", seg_start = s0,
+                        seg_end = s0 + cfg$warmup_h * 3600, n_blocks = NA_integer_,
+                        baseline_mean = NA_real_)
+  }
+
+  fl <- b %>% filter(flag)
+  if (nrow(fl) > 0) {
+    s <- as.numeric(fl$block_start); e <- as.numeric(fl$block_end)
+    grp <- cumsum(c(TRUE, s[-1] - e[-length(e)] > cfg$merge_gap_h * 3600))
+    out$odd <- fl %>%
+      mutate(grp = grp) %>%
+      group_by(grp) %>%
+      summarise(seg_start = min(block_start), seg_end = max(block_end),
+                n_blocks = n(), baseline_mean = mean(ref_mean), .groups = "drop") %>%
+      filter(n_blocks >= cfg$min_blocks) %>%
+      mutate(type = "odd_low") %>%
+      select(type, seg_start, seg_end, n_blocks, baseline_mean)
+  }
+
+  res <- bind_rows(out)
+  if (nrow(res) == 0) return(tibble())
+  res %>% mutate(
+    duration_h         = as.numeric(difftime(seg_end, seg_start, units = "hours")),
+    sensor_day_start   = as.numeric(difftime(seg_start, s0, units = "days")),
+    runs_to_sensor_end = seg_end >= s1 - 60,
+    mean_in_seg        = map2_dbl(seg_start, seg_end, ~ mean(d$gl[d$gluc_time >= .x & d$gluc_time <= .y])),
+    drop_pct           = 100 * (baseline_mean - mean_in_seg) / baseline_mean
+  )
+}
+```
+
+## Run
+
+```{r run}
+scored <- dat %>%
+  group_by(subject, session) %>%
+  group_modify(~ score_session(.x, cfg)) %>%
+  ungroup()
+
+segments <- scored %>%
+  group_by(subject, session) %>%
+  group_modify(function(b, key) {
+    d <- filter(dat, subject == key$subject, session == key$session)
+    make_segments(b, d, cfg)
+  }) %>%
+  ungroup()
+```
+
+## Result: flagged segments
+
+`sensor_day_start` = days after activation when the segment starts. `runs_to_sensor_end = TRUE` means the low period lasts until the last reading. `drop_pct` = how far below the healthy history the segment's mean is.
+
+```{r result}
+segments %>% mutate(across(c(duration_h, sensor_day_start, mean_in_seg, baseline_mean, drop_pct), ~ round(.x, 1)))
+```
+
+One list element per subject (empty if nothing flagged):
+
+```{r result-list}
+all_subjects <- unique(dat$subject)
+flagged_list <- map(setNames(all_subjects, all_subjects), function(s) {
+  segments %>% filter(subject == s) %>% select(session, type, seg_start, seg_end)
+})
+flagged_list
+```
+
+```{r save, eval=FALSE}
+write.csv(segments, "flagged_segments.csv", row.names = FALSE)
+saveRDS(flagged_list, "flagged_segments_list.rds")
+```
+
+## Visual check
+
+Black = readings, blue = mean of each usable 12 h block, grey dashed = history mean the block was compared to, red = low period, orange = elevated start. Blocks with gaps are skipped (no blue line).
+
+```{r plots}
+walk(all_subjects, function(s) {
+  sc  <- filter(scored, subject == s)
+  seg <- filter(segments, subject == s) %>%
+    mutate(seg_end_plot = pmax(seg_end, seg_start + 3 * 3600))   # make the short start flag visible
+  p <- ggplot(filter(dat, subject == s), aes(gluc_time, gl)) +
+    geom_point(size = 0.2) +
+    geom_rect(data = seg, aes(xmin = seg_start, xmax = seg_end_plot, ymin = -Inf, ymax = Inf, fill = type),
+              inherit.aes = FALSE, alpha = 0.25) +
+    geom_segment(data = filter(sc, ok & !is.na(ref_mean)),
+                 aes(x = block_start, xend = block_end, y = ref_mean, yend = ref_mean),
+                 inherit.aes = FALSE, colour = "grey40", linetype = 2) +
+    geom_segment(data = filter(sc, ok), aes(x = block_start, xend = block_end, y = mean_gl, yend = mean_gl),
+                 inherit.aes = FALSE, colour = "blue", linewidth = 0.8) +
+    scale_fill_manual(values = c(odd_low = "red", start_elevated = "orange")) +
+    labs(title = paste("Subject", s), x = "Time", y = "Glucose", fill = NULL) +
+    theme_minimal()
+  print(p)
+})
+```
+
+## Tuning notes
+
+- **Too many flags:** raise `z_low` (e.g. 2.5-3) or `min_drop_pct`, increase `min_blocks`, or set `min_sensor_day` (e.g. 7) to look only at later days.
+- **Missing a drop you see by eye:** lower `z_low` or `min_drop_pct`.
+- **False lows at night:** set `same_phase = TRUE` so each block is compared only with earlier blocks at the same time of day (day vs. day, night vs. night). This needs a longer history, so consider `min_hist_blocks = 3`.
+- Blocks are anchored at sensor start + `warmup_h`, so segment start/end times are on a 12 h grid.
+- The last block of a sensor can be partial (at least `min_block_h` hours) and may cover only day or only night time.
